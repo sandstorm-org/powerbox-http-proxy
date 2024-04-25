@@ -61,4 +61,4 @@ The daemon is mainly configured through environment variables:
     <https://github.com/go-sql-driver/mysql#dsn-data-source-name> for
     a description of the format.
 
-[1]: https://sandstorm.io
+[1]: https://sandstorm.org

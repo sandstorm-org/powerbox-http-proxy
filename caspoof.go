@@ -3,7 +3,7 @@ package main
 import (
 	"crypto/tls"
 
-	"zenhack.net/go/powerbox-http-proxy/certs"
+	"sandstorm.org/go/powerbox-http-proxy/certs"
 )
 
 type CertSpoofer struct {

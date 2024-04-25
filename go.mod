@@ -1,4 +1,4 @@
-module zenhack.net/go/powerbox-http-proxy
+module sandstorm.org/go/powerbox-http-proxy
 
 go 1.14
 
