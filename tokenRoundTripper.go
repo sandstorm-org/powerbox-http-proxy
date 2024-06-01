@@ -8,9 +8,9 @@ import (
 	"net"
 	"net/http"
 
-	"zenhack.net/go/sandstorm/capnp/grain"
-	bridge "zenhack.net/go/sandstorm/capnp/sandstormhttpbridge"
-	"zombiezen.com/go/capnproto2/rpc"
+	"sandstorm.org/go/tempest/capnp/grain"
+	bridge "sandstorm.org/go/tempest/capnp/sandstorm-http-bridge"
+	"capnproto.org/go/capnp/v3/rpc"
 )
 
 type tokenRoundTripper struct {

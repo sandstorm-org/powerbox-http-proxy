@@ -6,7 +6,7 @@ import (
 	"errors"
 	"log"
 
-	"zenhack.net/go/sandstorm/capnp/powerbox"
+	"sandstorm.org/go/tempest/capnp/powerbox"
 
 	"github.com/gorilla/websocket"
 )
