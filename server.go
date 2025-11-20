@@ -241,7 +241,7 @@ func powerboxDescriptorForUrl(url string) powerbox.PowerboxDescriptor {
 	tagValue, err := apisession.NewApiSession_PowerboxTag(seg)
 	chkfatal(err)
 	tagValue.SetCanonicalUrl(url)
-	tag.SetValue(tagValue.Struct.ToPtr())
+	tag.SetValue(tagValue.ToPtr())
 	return desc
 }
 

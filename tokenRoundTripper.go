@@ -81,7 +81,7 @@ func isValidToken(ctx context.Context, token string) (bool, error) {
 	rpcConn := rpc.NewConn(rpc.NewStreamTransport(netConn), nil)
 	defer rpcConn.Close()
 
-	bridgeClient := bridge.SandstormHttpBridge{Client: rpcConn.Bootstrap(ctx)}
+	bridgeClient := bridge.SandstormHttpBridge(rpcConn.Bootstrap(ctx))
 	apiFut, release := bridgeClient.GetSandstormApi(ctx, nil)
 	restoreFut, release := apiFut.Api().Restore(ctx, func(p grain.SandstormApi_restore_Params) error {
 		p.SetToken(tokenBytes)
