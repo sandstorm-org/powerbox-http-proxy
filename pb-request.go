@@ -6,7 +6,7 @@ import (
 	"errors"
 	"log"
 
-	"zenhack.net/go/sandstorm/capnp/powerbox"
+	"sandstorm.org/go/tempest/capnp/powerbox"
 
 	"github.com/gorilla/websocket"
 )
@@ -77,8 +77,8 @@ func (pr PowerboxRequester) Request(
 	query := make([]string, len(descr))
 	for i, v := range descr {
 		// Make sure this is the root of the message:
-		ptr := v.Struct.ToPtr()
-		msg := v.Struct.Segment().Message()
+		ptr := v.ToPtr()
+		msg := v.Segment().Message()
 		msg.SetRoot(ptr)
 
 		data, err := msg.MarshalPacked()

@@ -15,10 +15,10 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	capnp "zombiezen.com/go/capnproto2"
+	capnp "capnproto.org/go/capnp/v3"
 
-	"zenhack.net/go/sandstorm/capnp/apisession"
-	"zenhack.net/go/sandstorm/capnp/powerbox"
+	"sandstorm.org/go/tempest/capnp/api-session"
+	"sandstorm.org/go/tempest/capnp/powerbox"
 )
 
 func NewServer(storage Storage, spoofer *CertSpoofer) Server {
@@ -241,7 +241,7 @@ func powerboxDescriptorForUrl(url string) powerbox.PowerboxDescriptor {
 	tagValue, err := apisession.NewApiSession_PowerboxTag(seg)
 	chkfatal(err)
 	tagValue.SetCanonicalUrl(url)
-	tag.SetValue(tagValue.Struct.ToPtr())
+	tag.SetValue(tagValue.ToPtr())
 	return desc
 }
 

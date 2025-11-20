@@ -8,9 +8,9 @@ import (
 	"net"
 	"net/http"
 
-	"zenhack.net/go/sandstorm/capnp/grain"
-	bridge "zenhack.net/go/sandstorm/capnp/sandstormhttpbridge"
-	"zombiezen.com/go/capnproto2/rpc"
+	"sandstorm.org/go/tempest/capnp/grain"
+	bridge "sandstorm.org/go/tempest/capnp/sandstorm-http-bridge"
+	"capnproto.org/go/capnp/v3/rpc"
 )
 
 type tokenRoundTripper struct {
@@ -81,7 +81,7 @@ func isValidToken(ctx context.Context, token string) (bool, error) {
 	rpcConn := rpc.NewConn(rpc.NewStreamTransport(netConn), nil)
 	defer rpcConn.Close()
 
-	bridgeClient := bridge.SandstormHttpBridge{Client: rpcConn.Bootstrap(ctx)}
+	bridgeClient := bridge.SandstormHttpBridge(rpcConn.Bootstrap(ctx))
 	apiFut, release := bridgeClient.GetSandstormApi(ctx, nil)
 	restoreFut, release := apiFut.Api().Restore(ctx, func(p grain.SandstormApi_restore_Params) error {
 		p.SetToken(tokenBytes)
