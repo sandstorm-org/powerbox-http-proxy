@@ -132,8 +132,15 @@ func (s Server) handleConnect(w http.ResponseWriter, req *http.Request) {
 				}
 			}
 			defer resp.Body.Close()
-			resp.Write(tlsConn)
-			shouldClose = shouldClose || resp.Header.Get("Connection") == "close"
+			// Without a length or transfer encoding, EOF frames the response body.
+			if resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 {
+				resp.Close = true
+			}
+			if err := resp.Write(tlsConn); err != nil {
+				log.Printf("Failed to write proxied response: %v", err)
+				shouldClose = true
+			}
+			shouldClose = shouldClose || resp.Close || resp.Header.Get("Connection") == "close"
 		}()
 	}
 }
