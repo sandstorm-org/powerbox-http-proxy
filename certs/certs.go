@@ -2,8 +2,9 @@ package certs
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"
@@ -46,7 +47,7 @@ func GenCA() (CA, error) {
 		KeyUsage: x509.KeyUsageCertSign,
 
 	}
-	data, err := x509.CreateCertificate(nil, cert, cert, key.Public, key.Private)
+	data, err := x509.CreateCertificate(rand.Reader, cert, cert, key.Public, key.Private)
 	if err != nil {
 		return CA{}, err
 	}
@@ -62,7 +63,7 @@ func (ca CA) RawCert() []byte {
 }
 
 func GenKeyPair() (*KeyPair, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +91,7 @@ func (k KeyPair) GenCSR(hostName string) CSR {
 }
 
 func (ca CA) SignCSR(csr CSR) (*x509.Certificate, error) {
-	data, err := x509.CreateCertificate(nil, csr.template, ca.cert, csr.pubKey, ca.key.Private)
+	data, err := x509.CreateCertificate(rand.Reader, csr.template, ca.cert, csr.pubKey, ca.key.Private)
 	if err != nil {
 		return nil, err
 	}
