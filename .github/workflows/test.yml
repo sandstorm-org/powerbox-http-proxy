@@ -1,0 +1,28 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      POWERBOX_PROXY_PORT: "3000"
+      POWERBOX_WEBSOCKET_PORT: "3001"
+      CA_CERT_PATH: /tmp/proxy-test-ca.pem
+      DB_TYPE: sqlite3
+      DB_URI: ":memory:"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: go test -race -timeout 60s ./...
+      - run: node --test powerbox-network.test.cjs

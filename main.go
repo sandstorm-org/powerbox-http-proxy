@@ -57,7 +57,10 @@ func main() {
 	srv := NewServer(storage, caspoof)
 
 	go func() {
-		panic(http.ListenAndServe(webSocketListenAddr, srv.WebSocketHandler()))
+		mux := http.NewServeMux()
+		mux.Handle("/", srv.WebSocketHandler())
+		mux.Handle("/_sandstorm/network", srv.NetworkHandler())
+		panic(http.ListenAndServe(webSocketListenAddr, mux))
 	}()
 	panic(http.ListenAndServe(proxyListenAddr, srv.ProxyHandler()))
 }
