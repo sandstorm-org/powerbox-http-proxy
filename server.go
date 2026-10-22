@@ -24,6 +24,7 @@ import (
 func NewServer(storage Storage, spoofer *CertSpoofer) Server {
 	return Server{
 		storage:   storage,
+		network:   newNetworkAccess(),
 		spoofer:   spoofer,
 		pr:        NewPowerboxRequester(),
 		tokenLock: &sync.Mutex{},
@@ -31,6 +32,7 @@ func NewServer(storage Storage, spoofer *CertSpoofer) Server {
 }
 
 type Server struct {
+	network *networkAccess
 	storage Storage
 	spoofer *CertSpoofer
 	pr      *PowerboxRequester
@@ -139,6 +141,9 @@ func (s Server) handleConnect(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s Server) proxyRequest(req *http.Request) (*http.Response, error) {
+	if resp, err, configured := s.networkRequest(req); configured {
+		return resp, err
+	}
 	url := *req.URL
 	url.Path = ""
 	url.RawPath = ""

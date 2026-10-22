@@ -62,3 +62,80 @@ The daemon is mainly configured through environment variables:
     a description of the format.
 
 [1]: https://sandstorm.org
+
+# Optional IP network access
+
+Applications can offer an explicit IpNetwork Powerbox request to let a grain
+fetch many sites without approving each origin. Without a connected grant, the
+proxy continues to use its existing per-site ApiSession requests. Connecting a
+network changes HTTP/HTTPS access for the **whole grain**, including background
+jobs and requests from other collaborators.
+
+The proxy exposes an **internal backend API** at `/_sandstorm/network` on
+`POWERBOX_WEBSOCKET_PORT`. Do not forward this endpoint directly through nginx
+or expose the daemon's port to browsers. Your application backend must authorize
+users before forwarding status, connect, or disconnect requests. The existing
+`/_sandstorm/websocket` route remains unchanged.
+
+The internal API supports:
+
+- `GET`: returns JSON with `configured`, `valid`, and `descriptor`. The descriptor
+  is a base64-encoded Powerbox query for an unencrypted IpNetwork capability;
+  HTTPS encryption and certificate verification are performed by the proxy.
+  `valid` means the stored capability can currently be restored, not that every
+  destination is reachable.
+- `POST`: accepts JSON with `token` (the Powerbox claim token) and `sessionId`
+  (the requesting user's `X-Sandstorm-Session-Id` from the HTTP bridge).
+  `requiredPermissions` is an optional array of app permission names to include
+  in the claim. It defaults to `[]`, matching existing per-site claims. The
+  backend must supply the session and permission policy, rather than trust these
+  fields from the browser. Returns 204, or 409 if a network is already connected.
+- `DELETE`: closes active network requests, drops the durable capability, and
+  returns to per-site approvals. Returns 204, including when already disconnected.
+  If dropping the grant fails, returns 502 and retains the token for a retry;
+  network access may resume using that token until disconnect succeeds.
+
+Network grants persist across daemon/grain restarts. An unavailable or revoked
+configured grant causes outgoing requests to fail; it does not silently fall
+back to per-site prompts or direct sockets. Disconnect it to resume per-site
+approvals. Each network request uses its own RPC/TCP connection, so disconnect
+can close active transfers without leaving pooled connections behind. DNS and
+TCP connections go through the capability, and upstream HTTPS certificates are
+verified using the daemon's system trust store. The container must therefore
+include its usual CA certificate bundle.
+
+To build a browser UI, include `powerbox-network.js` alongside
+`powerbox-http-proxy.js`. Implement an application route at
+`/_sandstorm/network` that:
+
+1. Applies your app's authorization and CSRF checks for network management.
+2. For POST, accepts only the browser's `token`, adds the trusted session ID and
+   optional required permissions, and forwards the JSON to the internal API.
+3. For GET and DELETE, forwards the authorized request to the internal API.
+
+The helper sends `X-Sandstorm-App-Network: 1` on requests, which your backend can
+require as part of its CSRF protection (do not grant cross-origin access).
+It provides promises through:
+
+```javascript
+const state = await powerboxNetwork.status();
+await powerboxNetwork.connect('My app: network access'); // Opens the Powerbox chooser.
+await powerboxNetwork.disconnect();
+```
+
+Call `connect()` from an explicit user action, label the grain-wide effect in
+your UI, and display rejected promises to the user. UI layout and app-specific
+policies, such as disconnecting after an import, belong in the application.
+
+# Tests
+
+The Go tests use local HTTP servers and in-process Cap'n Proto services; a
+running Sandstorm instance is not required. The daemon currently reads required
+environment variables during package initialization, so provide them for tests:
+
+```sh
+POWERBOX_PROXY_PORT=3000 POWERBOX_WEBSOCKET_PORT=3001 \
+CA_CERT_PATH=/tmp/proxy-test-ca.pem DB_TYPE=sqlite3 DB_URI=:memory: \
+go test -race -timeout 60s ./...
+node --test powerbox-network.test.cjs
+```
