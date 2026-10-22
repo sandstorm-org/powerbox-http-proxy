@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 )
 
@@ -22,7 +23,11 @@ func (s Storage) Init() error {
 }
 
 func (s Storage) GetTokenFor(url string) (token string, err error) {
-	row := s.db.QueryRow(`
+	return s.GetTokenForContext(context.Background(), url)
+}
+
+func (s Storage) GetTokenForContext(ctx context.Context, url string) (token string, err error) {
+	row := s.db.QueryRowContext(ctx, `
 		SELECT token
 		FROM powerbox_proxy_tokens
 		WHERE url = ?`,
@@ -33,12 +38,16 @@ func (s Storage) GetTokenFor(url string) (token string, err error) {
 }
 
 func (s Storage) SetTokenFor(url, token string) error {
-	tx, err := s.db.Begin()
+	return s.SetTokenForContext(context.Background(), url, token)
+}
+
+func (s Storage) SetTokenForContext(ctx context.Context, url, token string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() // Will no-op if we've already comitted.
-	_, err = tx.Exec(
+	_, err = tx.ExecContext(ctx,
 		`DELETE FROM powerbox_proxy_tokens
 		WHERE url = ?`,
 		url,
@@ -46,7 +55,7 @@ func (s Storage) SetTokenFor(url, token string) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO powerbox_proxy_tokens(url, token)
 		VALUES (?, ?)`,
 		url, token,

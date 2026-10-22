@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -521,6 +522,159 @@ func TestNetworkClaimAndPersistence(t *testing.T) {
 			result := networkControl(restarted, "GET")
 			if result.Code != 200 || !strings.Contains(result.Body.String(), `"configured":true`) || !strings.Contains(result.Body.String(), `"valid":true`) {
 				t.Fatalf("grant did not survive restart: %v", result)
+			}
+		})
+	}
+}
+
+func TestNetworkCanceledDatabaseWait(t *testing.T) {
+	srv, _ := networkTestServer(t, "")
+	held, err := srv.storage.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err, _ := srv.networkRequest(httptest.NewRequest("GET", "http://example.test/", nil).WithContext(ctx))
+		done <- err
+	}()
+	deadline := time.After(time.Second)
+	for srv.storage.db.Stats().WaitCount == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("request never waited for database")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if !srv.network.mu.TryLock() {
+		t.Fatal("database wait holds state mutex")
+	}
+	srv.network.mu.Unlock()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled request still waiting for database")
+	}
+}
+
+func TestNetworkCanceledSave(t *testing.T) {
+	srv, _ := networkTestServer(t, "")
+	held, err := srv.storage.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := srv.saveNetwork(ctx, "token"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("save deadline: %v", err)
+	}
+	srv.network.mu.Lock()
+	defer srv.network.mu.Unlock()
+	if srv.network.changing {
+		t.Fatal("failed save left configuration locked")
+	}
+}
+
+type networkObservedBody struct {
+	io.ReadCloser
+	started chan struct{}
+	once    sync.Once
+}
+
+func (b *networkObservedBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	return b.ReadCloser.Read(p)
+}
+
+func TestNetworkSlowBodyDoesNotBlockControls(t *testing.T) {
+	for _, mode := range []string{"deadline", "cancellation"} {
+		t.Run(mode, func(t *testing.T) {
+			srv, _ := networkTestServer(t, "")
+			started, finished := make(chan struct{}), make(chan struct{})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "POST" {
+					defer close(finished)
+					requestCtx := ctx
+					if mode == "deadline" {
+						var stop context.CancelFunc
+						requestCtx, stop = context.WithTimeout(ctx, 200*time.Millisecond)
+						defer stop()
+					}
+					r = r.WithContext(requestCtx)
+					r.Body = &networkObservedBody{ReadCloser: r.Body, started: started}
+				}
+				srv.NetworkHandler().ServeHTTP(w, r)
+			}))
+			defer server.Close()
+			conn, err := net.Dial("tcp", server.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			fmt.Fprintf(conn, "POST /_sandstorm/network HTTP/1.1\r\nHost: test\r\nContent-Length: 100\r\n\r\n{")
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("body read never started")
+			}
+			client := &http.Client{Timeout: time.Second}
+			req, _ := http.NewRequest("DELETE", server.URL+"/_sandstorm/network", nil)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal("incomplete POST blocked DELETE:", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 204 {
+				t.Fatalf("disconnect: %d", resp.StatusCode)
+			}
+			if mode == "cancellation" {
+				cancel()
+			}
+			select {
+			case <-finished:
+			case <-time.After(time.Second):
+				t.Fatal("body read ignored timeout/cancellation")
+			}
+		})
+	}
+}
+
+func TestNetworkMutationWaitCancellation(t *testing.T) {
+	srv, _ := networkTestServer(t, "")
+	srv.network.changes <- struct{}{}
+	defer func() { <-srv.network.changes }()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	result := httptest.NewRecorder()
+	srv.NetworkHandler().ServeHTTP(result, httptest.NewRequest("DELETE", "/_sandstorm/network", nil).WithContext(ctx))
+	if result.Code != http.StatusGatewayTimeout {
+		t.Fatalf("mutation wait: %v", result)
+	}
+}
+
+func TestNetworkRPCErrorContext(t *testing.T) {
+	for _, test := range []struct{ url, operation string }{
+		{"http://invalid.test/", "resolve network host"},
+		{"http://example.test:999/", "get network TCP port"},
+		{"http://example.test/", "connect network TCP stream"},
+	} {
+		t.Run(test.operation, func(t *testing.T) {
+			srv, _ := networkTestServer(t, "invalid-address")
+			configureNetwork(t, srv)
+			_, err, _ := srv.networkRequest(httptest.NewRequest("GET", test.url, nil))
+			if err == nil || !strings.Contains(err.Error(), test.operation) {
+				t.Fatalf("error: %v", err)
 			}
 		})
 	}

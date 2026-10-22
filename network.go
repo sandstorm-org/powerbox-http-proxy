@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -28,20 +29,21 @@ import (
 const networkKey = "sandstorm:ip-network"
 
 // changes serializes configuration changes; mu protects request registration.
-// Never hold mu while calling the bridge or closing an RPC connection.
+// Never hold mu across database or bridge I/O, or while closing a connection.
 type networkAccess struct {
-	transport     *http.Transport // Cloned per request; connections are never pooled across grants.
-	changes       sync.Mutex
-	mu            sync.Mutex
-	generation    uint64
-	disconnecting bool
-	active        map[*rpc.Conn]context.CancelFunc
-	openAPI       func(context.Context) (*rpc.Conn, grain.SandstormApi, func(), error)
+	transport  *http.Transport // Cloned per request; connections are never pooled across grants.
+	changes    chan struct{}
+	mu         sync.Mutex
+	generation uint64
+	changing   bool
+	active     map[*rpc.Conn]context.CancelFunc
+	openAPI    func(context.Context) (*rpc.Conn, grain.SandstormApi, func(), error)
 }
 
 func newNetworkAccess() *networkAccess {
 	return &networkAccess{
 		active:  make(map[*rpc.Conn]context.CancelFunc),
+		changes: make(chan struct{}, 1),
 		openAPI: openNetworkAPI,
 		transport: &http.Transport{
 			DisableKeepAlives:     true,
@@ -54,7 +56,7 @@ func newNetworkAccess() *networkAccess {
 func openNetworkAPI(ctx context.Context) (*rpc.Conn, grain.SandstormApi, func(), error) {
 	socket, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "unix", "/tmp/sandstorm-api")
 	if err != nil {
-		return nil, grain.SandstormApi{}, nil, err
+		return nil, grain.SandstormApi{}, nil, fmt.Errorf("connect to Sandstorm API: %w", err)
 	}
 	conn := rpc.NewConn(rpc.NewStreamTransport(socket), nil)
 	b := bridge.SandstormHttpBridge(conn.Bootstrap(ctx))
@@ -69,20 +71,21 @@ func claimNetwork(ctx context.Context, result *PowerboxResult, permissions []str
 	if permissions == nil {
 		permissions = []string{}
 	}
-	body, err := json.Marshal(map[string]interface{}{
-		"requestToken": result.ClaimToken, "requiredPermissions": permissions,
-	})
+	body, err := json.Marshal(struct {
+		RequestToken        string   `json:"requestToken"`
+		RequiredPermissions []string `json:"requiredPermissions"`
+	}{RequestToken: result.ClaimToken, RequiredPermissions: permissions})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("claim network capability: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", "http://http-bridge/session/"+result.SessionId+"/claim", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("claim network capability: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("claim network capability: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -92,13 +95,13 @@ func claimNetwork(ctx context.Context, result *PowerboxResult, permissions []str
 		Cap string `json:"cap"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&saved); err != nil {
-		return "", err
+		return "", fmt.Errorf("claim network capability: %w", err)
 	}
 	if saved.Cap == "" {
 		return "", errors.New("bridge returned no capability")
 	}
 	if _, err := base64.StdEncoding.DecodeString(saved.Cap); err != nil {
-		return "", err
+		return "", fmt.Errorf("claim network capability: %w", err)
 	}
 	return saved.Cap, nil
 }
@@ -106,18 +109,21 @@ func claimNetwork(ctx context.Context, result *PowerboxResult, permissions []str
 func (s Server) validNetworkToken(ctx context.Context, token string) (bool, error) {
 	data, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("restore network capability: %w", err)
 	}
 	conn, api, release, err := s.network.openAPI(ctx)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("restore network capability: %w", err)
 	}
 	defer conn.Close()
 	defer release()
 	restored, done := api.Restore(ctx, func(p grain.SandstormApi_restore_Params) error { return p.SetToken(data) })
 	defer done()
 	_, err = restored.Struct()
-	return err == nil, err
+	if err != nil {
+		return false, fmt.Errorf("restore network capability: %w", err)
+	}
+	return true, nil
 }
 
 func networkDescriptor() string {
@@ -150,17 +156,27 @@ func (s Server) NetworkHandler() http.Handler {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		// Status RPCs do not block changes or outgoing requests. Serialize only
-		// mutations so two concurrent claims cannot replace/leak one another.
-		if r.Method != "GET" {
-			s.network.changes.Lock()
-			defer s.network.changes.Unlock()
-		}
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-		s.network.mu.Lock()
-		token, err := s.storage.GetTokenFor(networkKey)
-		s.network.mu.Unlock()
+		var body networkClaim
+		if r.Method == "POST" {
+			if err := readNetworkClaim(ctx, w, r, &body); err != nil {
+				http.Error(w, "Invalid claim token or session ID", http.StatusBadRequest)
+				return
+			}
+		}
+		// Decode before serializing mutations, so an incomplete body cannot
+		// block other controls. Waiting for a mutation also obeys the deadline.
+		if r.Method != "GET" {
+			select {
+			case s.network.changes <- struct{}{}:
+				defer func() { <-s.network.changes }()
+			case <-ctx.Done():
+				http.Error(w, "Network settings request timed out", http.StatusGatewayTimeout)
+				return
+			}
+		}
+		token, err := s.storage.GetTokenForContext(ctx, networkKey)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "Cannot read network settings", http.StatusInternalServerError)
 			return
@@ -172,21 +188,14 @@ func (s Server) NetworkHandler() http.Handler {
 				valid, _ = s.validNetworkToken(ctx, token)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"configured": token != "", "valid": valid, "descriptor": networkDescriptor(),
-			})
+			json.NewEncoder(w).Encode(struct {
+				Configured bool   `json:"configured"`
+				Valid      bool   `json:"valid"`
+				Descriptor string `json:"descriptor"`
+			}{Configured: token != "", Valid: valid, Descriptor: networkDescriptor()})
 		case "POST":
 			if token != "" {
 				http.Error(w, "Disconnect the existing network first", http.StatusConflict)
-				return
-			}
-			var body struct {
-				Token               string   `json:"token"`
-				SessionID           string   `json:"sessionId"`
-				RequiredPermissions []string `json:"requiredPermissions"`
-			}
-			if json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&body) != nil || body.Token == "" || body.SessionID == "" {
-				http.Error(w, "Missing claim token or session ID", http.StatusBadRequest)
 				return
 			}
 			saved, err := claimNetwork(ctx, &PowerboxResult{
@@ -196,12 +205,7 @@ func (s Server) NetworkHandler() http.Handler {
 				http.Error(w, "Could not claim network access", http.StatusBadGateway)
 				return
 			}
-			s.network.mu.Lock()
-			err = s.storage.SetTokenFor(networkKey, saved)
-			if err == nil {
-				s.network.generation++
-			}
-			s.network.mu.Unlock()
+			err = s.saveNetwork(ctx, saved)
 			if err != nil {
 				// The request may already be canceled. Still try to drop the
 				// durable grant that we could not save.
@@ -225,31 +229,86 @@ func (s Server) NetworkHandler() http.Handler {
 	})
 }
 
+type networkClaim struct {
+	Token               string   `json:"token"`
+	SessionID           string   `json:"sessionId"`
+	RequiredPermissions []string `json:"requiredPermissions"`
+}
+
+func readNetworkClaim(ctx context.Context, w http.ResponseWriter, r *http.Request, claim *networkClaim) error {
+	controller := http.NewResponseController(w)
+	deadline, _ := ctx.Deadline()
+	if err := controller.SetReadDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return fmt.Errorf("set network claim read deadline: %w", err)
+	}
+	// A context alone does not interrupt HTTP body reads. Wake the connection
+	// on cancellation as well, and finish the callback before resetting it.
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		controller.SetReadDeadline(time.Now())
+		close(interrupted)
+	})
+	defer func() {
+		if !stop() {
+			<-interrupted
+		}
+		controller.SetReadDeadline(time.Time{})
+	}()
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(claim); err != nil {
+		return fmt.Errorf("decode network claim: %w", err)
+	}
+	if claim.Token == "" || claim.SessionID == "" {
+		return errors.New("missing claim token or session ID")
+	}
+	return ctx.Err()
+}
+
+// Caller holds changes. Mark the transition before touching storage, so request
+// snapshots taken before or during the write cannot register an obsolete grant.
+func (s Server) saveNetwork(ctx context.Context, token string) error {
+	s.network.mu.Lock()
+	s.network.changing = true
+	s.network.generation++
+	s.network.mu.Unlock()
+	defer func() {
+		s.network.mu.Lock()
+		s.network.changing = false
+		s.network.mu.Unlock()
+	}()
+	if err := s.storage.SetTokenForContext(ctx, networkKey, token); err != nil {
+		return fmt.Errorf("save network capability: %w", err)
+	}
+	return nil
+}
+
 func (s Server) dropNetworkToken(ctx context.Context, token string) error {
 	if token == "" {
 		return nil
 	}
 	data, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
-		return err
+		return fmt.Errorf("drop network capability: %w", err)
 	}
 	conn, api, release, err := s.network.openAPI(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("drop network capability: %w", err)
 	}
 	defer conn.Close()
 	defer release()
 	result, done := api.Drop(ctx, func(p grain.SandstormApi_drop_Params) error { return p.SetToken(data) })
 	defer done()
 	_, err = result.Struct()
-	return err
+	if err != nil {
+		return fmt.Errorf("drop network capability: %w", err)
+	}
+	return nil
 }
 
 // Caller holds changes. Block new requests while disconnecting and invalidate
 // requests still opening a bridge connection, then close registered streams.
 func (s Server) disconnectNetwork(ctx context.Context, token string) error {
 	s.network.mu.Lock()
-	s.network.disconnecting = true
+	s.network.changing = true
 	s.network.generation++
 	active := make(map[*rpc.Conn]context.CancelFunc, len(s.network.active))
 	for conn, cancel := range s.network.active {
@@ -258,7 +317,7 @@ func (s Server) disconnectNetwork(ctx context.Context, token string) error {
 	s.network.mu.Unlock()
 	defer func() {
 		s.network.mu.Lock()
-		s.network.disconnecting = false
+		s.network.changing = false
 		s.network.mu.Unlock()
 	}()
 	for conn, cancel := range active {
@@ -269,41 +328,50 @@ func (s Server) disconnectNetwork(ctx context.Context, token string) error {
 	if err := s.dropNetworkToken(ctx, token); err != nil {
 		return err
 	}
-	s.network.mu.Lock()
-	defer s.network.mu.Unlock()
-	_, err := s.storage.db.Exec("DELETE FROM powerbox_proxy_tokens WHERE url = ?", networkKey)
-	return err
+	_, err := s.storage.db.ExecContext(ctx, "DELETE FROM powerbox_proxy_tokens WHERE url = ?", networkKey)
+	if err != nil {
+		return fmt.Errorf("delete network capability: %w", err)
+	}
+	return nil
 }
 
 // Each request restores the capability afresh. No connection pool can outlive
 // revocation; closing its RPC connection also terminates the response stream.
 func (s Server) networkRequest(req *http.Request) (*http.Response, error, bool) {
 	s.network.mu.Lock()
-	if s.network.disconnecting {
+	if s.network.changing {
 		s.network.mu.Unlock()
-		return nil, errors.New("network is disconnecting"), true
+		return nil, errors.New("network configuration is changing"), true
 	}
 	generation := s.network.generation
-	token, err := s.storage.GetTokenFor(networkKey)
 	s.network.mu.Unlock()
+	lookupCtx, cancelLookup := context.WithTimeout(req.Context(), 15*time.Second)
+	token, err := s.storage.GetTokenForContext(lookupCtx, networkKey)
+	cancelLookup()
+	s.network.mu.Lock()
+	changed := generation != s.network.generation || s.network.changing
+	s.network.mu.Unlock()
+	if changed {
+		return nil, errors.New("network configuration changed"), true
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, false
 	}
 	if err != nil {
-		return nil, err, true
+		return nil, fmt.Errorf("read network capability: %w", err), true
 	}
 	tokenBytes, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
-		return nil, err, true
+		return nil, fmt.Errorf("decode network capability: %w", err), true
 	}
 	ctx, cancel := context.WithCancel(req.Context())
 	conn, api, release, err := s.network.openAPI(ctx)
 	if err != nil {
 		cancel()
-		return nil, err, true
+		return nil, fmt.Errorf("open network API: %w", err), true
 	}
 	s.network.mu.Lock()
-	if generation != s.network.generation || s.network.disconnecting {
+	if generation != s.network.generation || s.network.changing {
 		s.network.mu.Unlock()
 		cancel()
 		release()
@@ -342,12 +410,15 @@ func (s Server) networkRequest(req *http.Request) (*http.Response, error, bool) 
 		defer finishRestore()
 		result, err := restored.Struct()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("restore network capability: %w", err)
 		}
 		capability := ip.IpNetwork(result.Cap())
 		remote, finishHost := capability.GetRemoteHostByName(dialCtx, func(p ip.IpNetwork_getRemoteHostByName_Params) error { return p.SetAddress(host) })
 		defer finishHost()
-		tcp, finishPort := remote.Host().GetTcpPort(dialCtx, func(p ip.IpRemoteHost_getTcpPort_Params) error { p.SetPortNum(uint16(port)); return nil })
+		tcp, finishPort := remote.Host().GetTcpPort(dialCtx, func(p ip.IpRemoteHost_getTcpPort_Params) error {
+			p.SetPortNum(uint16(port))
+			return nil
+		})
 		defer finishPort()
 		streamCtx, stopStream := context.WithCancel(ctx)
 		incoming, downstream := bytestream.Pipe()
@@ -357,16 +428,40 @@ func (s Server) networkRequest(req *http.Request) (*http.Response, error, bool) 
 			stopStream()
 			incoming.Close()
 			finishConnect()
-			return nil, err
+			// Preserve pipelining on success, but identify which RPC failed.
+			if _, hostErr := remote.Struct(); hostErr != nil {
+				return nil, fmt.Errorf("resolve network host %q: %w", host, hostErr)
+			}
+			if _, portErr := tcp.Struct(); portErr != nil {
+				return nil, fmt.Errorf("get network TCP port %s: %w", address, portErr)
+			}
+			return nil, fmt.Errorf("connect network TCP stream %s: %w", address, err)
 		}
 		upstream := connected.Upstream().AddRef()
 		writer := bytestream.ToWriteCloser(streamCtx, upstream)
 		client, relay := net.Pipe()
 		var closeOnce sync.Once
-		closeStream := func() { closeOnce.Do(func() { stopStream(); relay.Close(); incoming.Close(); finishConnect() }) }
-		go func() { io.Copy(relay, incoming); closeStream() }()
-		go func() { defer upstream.Release(); io.Copy(writer, relay); closeStream() }()
-		go func() { <-ctx.Done(); closeStream() }()
+		closeStream := func() {
+			closeOnce.Do(func() {
+				stopStream()
+				relay.Close()
+				incoming.Close()
+				finishConnect()
+			})
+		}
+		go func() {
+			defer closeStream()
+			io.Copy(relay, incoming)
+		}()
+		go func() {
+			defer upstream.Release()
+			defer closeStream()
+			io.Copy(writer, relay)
+		}()
+		go func() {
+			<-ctx.Done()
+			closeStream()
+		}()
 		return client, nil
 	}
 	clone := req.Clone(ctx)
@@ -386,4 +481,7 @@ type networkBody struct {
 	cleanup func()
 }
 
-func (b *networkBody) Close() error { err := b.ReadCloser.Close(); b.cleanup(); return err }
+func (b *networkBody) Close() error {
+	defer b.cleanup()
+	return b.ReadCloser.Close()
+}
